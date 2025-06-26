@@ -1,148 +1,77 @@
-#!/usr/bin/env python3 """Auto VM start/stop based on the AutoShutdown tag.
+import time
+import re
+from datetime import datetime, timedelta
+import pytz
+from azure.identity import AzureCliCredential
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.subscription import SubscriptionClient
 
-Conversion fidèle du script PowerShell fourni, avec quelques améliorations :
+# Set up your Azure credentials and client
+tenant_id = "tenantid"
+subscription_client = SubscriptionClient(AzureCliCredential())
+compute_client = ComputeManagementClient(AzureCliCredential(), subscription_id='your_subscription_id')
 
-Validation stricte du tag (même expression régulière).
+# Define the function to get enabled subscriptions
+def get_enabled_subscriptions():
+    subscriptions = []
+    for sub in subscription_client.subscriptions.list():
+        if sub.state == 'Enabled' and re.match(r"^(PRD|PPD|OTH)[ \t]-[ \t]", sub.display_name):
+            subscriptions.append(sub)
+    return subscriptions
 
-Gestion du fuseau horaire « Europe/Paris » à l’aide de zoneinfo.
+# Convert to Europe/Paris time zone
+def get_current_time():
+    tz = pytz.timezone('Europe/Paris')
+    return datetime.now(tz)
 
-Prise en charge de plusieurs abonnements filtrés par tenant et par nom.
+# Define the AutoShutdown logic
+def check_and_shutdown_vms(subscription):
+    now = get_current_time()
+    current_day = now.strftime('%A')
 
-Actions non bloquantes grâce aux méthodes begin_start / begin_deallocate.
+    # Get all VMs in the subscription
+    vms = compute_client.virtual_machines.list_all()
+    for vm in vms:
+        if vm.tags and 'AutoShutdown' in vm.tags:
+            auto_shutdown_value = vm.tags['AutoShutdown']
+            # Regex check
+            if not re.match(r"^Monday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Tuesday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Wednesday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Thursday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Friday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Saturday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Sunday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE)$", auto_shutdown_value):
+                print(f"AutoShutdown tag value not valid | {subscription.display_name} | {vm.name} | {vm.power_state} | {auto_shutdown_value}")
+            else:
+                # If the AutoShutdown value is valid, proceed with the logic
+                print(f"{subscription.display_name} | {vm.name} | {vm.power_state} | {auto_shutdown_value}")
 
+                auto_shutdown_days = auto_shutdown_value.split(";")
+                start_datetime = None
+                stop_datetime = None
 
+                for auto_shutdown_day in auto_shutdown_days:
+                    if auto_shutdown_day.split(" ")[0].lower() == current_day.lower():
+                        if auto_shutdown_day.split(" ")[1].lower() != "none":
+                            start_time = auto_shutdown_day.split(" ")[1].split("-")[0]
+                            stop_time = auto_shutdown_day.split(" ")[1].split("-")[1]
+                            start_datetime = datetime.strptime(f"{now.strftime('%Y-%m-%d')} {start_time}", '%Y-%m-%d %I:%M%p')
+                            stop_datetime = datetime.strptime(f"{now.strftime('%Y-%m-%d')} {stop_time}", '%Y-%m-%d %I:%M%p')
 
----
+                if start_datetime and stop_datetime:
+                    if vm.power_state != "VM running" and now < stop_datetime and now + timedelta(minutes=10) >= start_datetime:
+                        compute_client.virtual_machines.start(subscription_id=subscription.id, resource_group_name=vm.resource_group_name, vm_name=vm.name)
+                        print(f"Start VM | {subscription.display_name} | {vm.name} | {vm.power_state} | {auto_shutdown_value}")
 
-Prérequis
+                if not start_datetime or not stop_datetime:
+                    if vm.power_state != "VM deallocated":
+                        compute_client.virtual_machines.deallocate(subscription_id=subscription.id, resource_group_name=vm.resource_group_name, vm_name=vm.name)
+                        print(f"Stop VM | {subscription.display_name} | {vm.name} | {vm.power_state} | {auto_shutdown_value}")
 
-pip install azure-identity azure-mgmt-resource azure-mgmt-compute
+                if start_datetime and stop_datetime and vm.power_state != "VM deallocated" and now >= stop_datetime + timedelta(minutes=10):
+                    compute_client.virtual_machines.deallocate(subscription_id=subscription.id, resource_group_name=vm.resource_group_name, vm_name=vm.name)
+                    print(f"Stop VM | {subscription.display_name} | {vm.name} | {vm.power_state} | {auto_shutdown_value}")
 
-Assurez‑vous d’être authentifié :
+# Main function
+def main():
+    subscriptions = get_enabled_subscriptions()
+    for subscription in subscriptions:
+        check_and_shutdown_vms(subscription)
 
-az login --tenant <votre‑tenant>
-
-
----
-
-Usage
-
-python auto_shutdown.py
-
-"""
-
-from future import annotations
-
-import re import sys from datetime import datetime, timedelta from typing import Tuple
-
-from zoneinfo import ZoneInfo
-
-from azure.identity import DefaultAzureCredential from azure.mgmt.compute import ComputeManagementClient from azure.mgmt.resource import SubscriptionClient
-
----------------------------------------------------------------------------
-
-Configuration utilisateur
-
----------------------------------------------------------------------------
-
-TENANT_ID = "tenantid"  # ⇦ à adapter si besoin (laisser None pour ignorer) TIMEZONE = ZoneInfo("Europe/Paris")  # équivalent « W. Europe Standard Time »
-
-Expression régulière de validation du tag (copiée de la version PowerShell)
-
-TAG_PATTERN = re.compile( r"^Monday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Tuesday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Wednesday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Thursday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Friday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Saturday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Sunday (((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE)$", re.IGNORECASE, )
-
----------------------------------------------------------------------------
-
-Fonctions utilitaires
-
----------------------------------------------------------------------------
-
-def get_power_state(instance_view) -> str: """Renvoie l’état d’alimentation sous forme de chaîne (ex. « VM running »).""" for status in instance_view.statuses or []: if status.code.startswith("PowerState/"): return status.display_status return "Unknown"
-
-def parse_autoshutdown(tag_value: str, current_day: str) -> Tuple[datetime | None, datetime | None]: """Extrait les horaires pour current_day du tag AutoShutdown.
-
-Renvoie `(start_dt, stop_dt)` en timezone *TIMEZONE* ou `(None, None)` si
-le planning du jour vaut `NONE` ou est absent.
-"""
-for day_entry in tag_value.split(";"):
-    try:
-        day_name, schedule = day_entry.strip().split(" ", 1)
-    except ValueError:
-        continue  # entrée mal formée ; la validation aura déjà prévenu
-
-    if day_name.lower() != current_day.lower():
-        continue
-
-    if schedule.lower() == "none":
-        return None, None
-
-    start_str, stop_str = (s.strip() for s in schedule.split("-", 1))
-    today = datetime.now(TIMEZONE).date()
-
-    start_dt = datetime.combine(today, datetime.strptime(start_str, "%I:%M%p").time(), TIMEZONE)
-    stop_dt = datetime.combine(today, datetime.strptime(stop_str, "%I:%M%p").time(), TIMEZONE)
-    return start_dt, stop_dt
-
-return None, None  # jour non trouvé ⇒ pas de planning
-
----------------------------------------------------------------------------
-
-Logique principale
-
----------------------------------------------------------------------------
-
-def main() -> None: now = datetime.now(TIMEZONE) current_day = now.strftime("%A")
-
-credential = DefaultAzureCredential()
-subs_client = SubscriptionClient(credential)
-
-for sub in subs_client.subscriptions.list():
-    # Filtre tenant et état
-    if TENANT_ID and getattr(sub, "tenant_id", None) and sub.tenant_id.lower() != TENANT_ID.lower():
-        continue
-    if sub.state != "Enabled":
-        continue
-    if not re.match(r"^(PRD|PPD|OTH)[ \t]-[ \t]", sub.display_name):
-        continue
-
-    print(f"\n=== Abonnement : {sub.display_name} ({sub.subscription_id}) ===")
-    compute = ComputeManagementClient(credential, sub.subscription_id)
-
-    for vm in compute.virtual_machines.list_all():
-        tags = vm.tags or {}
-        if "AutoShutdown" not in tags:
-            continue
-
-        tag_value = tags["AutoShutdown"]
-        if not TAG_PATTERN.match(tag_value):
-            print(f"⚠️  Tag invalide | {sub.display_name} | {vm.name} | {tag_value}")
-            continue
-
-        resource_group = vm.id.split("/")[4]
-        iview = compute.virtual_machines.instance_view(resource_group, vm.name)
-        power_state = get_power_state(iview)
-
-        start_dt, stop_dt = parse_autoshutdown(tag_value, current_day)
-        print(f"{sub.display_name} | {vm.name} | {power_state} | {tag_value}")
-
-        if start_dt and stop_dt:
-            # Créneau défini pour aujourd’hui
-            if power_state != "VM running" and now < stop_dt and now + timedelta(minutes=10) >= start_dt:
-                print("→ Démarrage de la VM (fenêtre d’ouverture)…")
-                compute.virtual_machines.begin_start(resource_group, vm.name)
-                continue
-
-            if power_state != "VM deallocated" and now >= stop_dt + timedelta(minutes=10):
-                print("→ Arrêt de la VM (fin de fenêtre)…")
-                compute.virtual_machines.begin_deallocate(resource_group, vm.name, skip_shutdown=True)
-                continue
-        else:
-            # Pas de créneau prévu aujourd’hui
-            if power_state != "VM deallocated":
-                print("→ Arrêt de la VM (aucun planning)…")
-                compute.virtual_machines.begin_deallocate(resource_group, vm.name, skip_shutdown=True)
-
-print("\nTerminé avec succès.")
-
-if name == "main": try: main() except KeyboardInterrupt: sys.exit("Interrompu par l’utilisateur") except Exception as exc:  # pragma: no cover print(f"ERREUR : {exc}", file=sys.stderr) sys.exit(1)
-
+if __name__ == "__main__":
+    main()
