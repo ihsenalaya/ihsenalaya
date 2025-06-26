@@ -1,0 +1,38 @@
+#!/usr/bin/env python3 """Auto VM start/stop based on “AutoShutdown” tag.
+
+Converted from the original PowerShell script supplied by the user.
+
+Prerequisites
+
+$ pip install azure-identity azure-mgmt-resource azure-mgmt-compute
+
+Ensure you are already logged-in (e.g. az login) or running inside an Azure-hosted workload identity (Managed Identity, GitHub OIDC, etc.). The script relies on DefaultAzureCredential to locate your credentials.
+
+Environment
+
+• Python 3.10 + • Azure SDK for Python >= 10.x
+
+Usage
+
+$ python auto_shutdown.py """
+
+from future import annotations
+
+import re import sys from datetime import datetime, timedelta from typing import Tuple
+
+from zoneinfo import ZoneInfo
+
+from azure.identity import DefaultAzureCredential from azure.mgmt.compute import ComputeManagementClient from azure.mgmt.resource import SubscriptionClient
+
+---------------------------------------------------------------------------
+
+User-specific constants
+
+---------------------------------------------------------------------------
+
+TENANT_ID = "tenantid"  # ⇦ replace with your tenant ID or set to None TIMEZONE = ZoneInfo("Europe/Paris")  # “W. Europe Standard Time” equivalent
+
+Tag validation pattern (verbatim from the PowerShell script)
+
+TAG_PATTERN = re.compile( r"""^Monday\s+(((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Tuesday\s+(((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Wednesday\s+(((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M)|NONE);Thursday\s+(((([0-9]|1[0-2])|0[0-9]):(([0-9]|[1-5][0-9])|0[0-9])[AP]M-(([0-9]|1[0-2])
+
